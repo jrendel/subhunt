@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>SubHunt v1.4 — TI-83 Replica</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:#1c1d20;font-family:monospace;color:#9aa08e;padding:16px;box-sizing:border-box}
+  .calc{background:#2e3136;border-radius:14px;padding:18px 18px 14px;box-shadow:0 8px 30px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.06)}
+  .brand{display:flex;justify-content:space-between;font-size:10px;letter-spacing:2px;color:#7e848f;margin-bottom:8px}
+  .lcdwrap{background:#444b3e;padding:8px;border-radius:4px;box-shadow:inset 0 2px 8px rgba(0,0,0,.7)}
+  canvas{display:block;width:480px;max-width:86vw;image-rendering:pixelated;image-rendering:crisp-edges;background:#9cad86}
+  .pads{display:flex;gap:10px;margin-top:14px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+  button{background:#3c4046;color:#cfd4c6;border:none;border-radius:6px;padding:12px 16px;font-family:monospace;
+    font-size:13px;cursor:pointer;box-shadow:0 3px 0 #23262a;user-select:none;-webkit-user-select:none;touch-action:none}
+  button:active{transform:translateY(2px);box-shadow:0 1px 0 #23262a}
+  .grp{display:flex;gap:8px}
+  .help{margin-top:14px;font-size:11px;line-height:1.7;color:#6d7366;text-align:center;max-width:480px}
+  .help b{color:#9aa08e}
+</style>
+</head>
+<body>
+<div class="calc">
+  <div class="brand"><span>TI-83 PLUS</span><span>ION&nbsp;&middot;&nbsp;SUBHUNT v1.4</span></div>
+  <div class="lcdwrap"><canvas id="lcd" width="96" height="64"></canvas></div>
+  <div class="pads">
+    <div class="grp">
+      <button id="bL">&#9664;</button>
+      <button id="bR">&#9654;</button>
+    </div>
+    <button id="bEnt">ENTER</button>
+    <div class="grp">
+      <button id="bFL">FIRE&nbsp;L</button>
+      <button id="bFR">FIRE&nbsp;R</button>
+    </div>
+  </div>
+</div>
+<div class="help">
+  <b>&larr;/&rarr;</b> move &nbsp;&middot;&nbsp; <b>Z</b> fire left (2nd) &nbsp;&middot;&nbsp; <b>X</b> fire right (MODE)
+  &nbsp;&middot;&nbsp; <b>P</b> pause (DEL) &nbsp;&middot;&nbsp; <b>Esc</b> quit (CLEAR) &nbsp;&middot;&nbsp; <b>Enter</b> start / continue<br>
+  Deeper + faster subs are worth more. 3 hits sinks you. Homing missiles appear at level 8. 15 levels.
+</div>
+
+<script>
+/* =====================================================================
+   SubHunt v1.4 (Sam Heald, 2000) — faithful mechanics port of the Z80
+   source to JS/canvas. 96x64 1-bit buffer, XOR sprite compositing,
+   original sprite bytes, spawn/speed/score/collision logic preserved.
+   ===================================================================== */
+const W=96, H=64, FPS=30;
+const cv=document.getElementById('lcd'), ctx=cv.getContext('2d');
+const img=ctx.createImageData(W,H);
+const BG=[156,173,134], FG=[28,36,24];
+let buf=new Uint8Array(W*H);
+
+function clearBuf(){ buf.fill(0); }
+function xp(x,y){ x|=0;y|=0; if(x>=0&&x<W&&y>=0&&y<H) buf[y*W+x]^=1; }      // XOR pixel (sprites)
+function sp(x,y,v){ x|=0;y|=0; if(x>=0&&x<W&&y>=0&&y<H) buf[y*W+x]=v; }     // set/clear pixel (text)
+function present(){
+  const d=img.data;
+  for(let i=0;i<W*H;i++){
+    const c=buf[i]?FG:BG, j=i*4;
+    d[j]=c[0]; d[j+1]=c[1]; d[j+2]=c[2]; d[j+3]=255;
+  }
+  ctx.putImageData(img,0,0);
+}
+function xorSpr(rows,w,x,y){
+  for(let r=0;r<rows.length;r++){
+    const v=rows[r]; if(!v) continue;
+    for(let b=0;b<w;b++) if((v>>(w-1-b))&1) xp(x+b,y+r);
+  }
+}
+
+/* ---------- original sprite data (verbatim from subhunt.z80) ---------- */
+const BOAT=[0x006600,0x046610,0x02FF27,0x07FFC4,0xFFFFFE,0x7FFFFC,0x3FFFF8,0x1FFFF0]; // 24x8
+const SUBR=[0x07F8,0xB806,0xF807,0xF807,0xF807,0xB806,0x0000,0x0000];                 // 16x8
+const SUBL=[0x0FF0,0x700D,0xF00F,0xF00F,0xF00F,0x700D,0x0000,0x0000];
+const BOMB =[0xC0,0xC0];                       // player depth charge
+const EBOMB=[0xA0,0x40,0xA0];                  // enemy shot
+const EBOMB2=[0x40,0x40,0xA0];                 // homing missile
+const EXPL =[0x70,0xD8,0xA8,0xD8,0x70];        // sub explosion
+const EXPL2=[0xAA,0x54,0x38];                  // surface detonation
+
+/* ---------- tiny 3x5 font (TI small-font stand-in) ---------- */
+const F={
+'A':[2,5,7,5,5],'B':[6,5,6,5,6],'C':[3,4,4,4,3],'D':[6,5,5,5,6],'E':[7,4,6,4,7],
+'F':[7,4,6,4,4],'G':[3,4,5,5,3],'H':[5,5,7,5,5],'I':[7,2,2,2,7],'J':[1,1,1,5,2],
+'K':[5,6,4,6,5],'L':[4,4,4,4,7],'M':[5,7,7,5,5],'N':[6,5,5,5,5],'O':[2,5,5,5,2],
+'P':[6,5,6,4,4],'Q':[7,5,5,7,1],'R':[6,5,6,6,5],'S':[3,4,2,1,6],'T':[7,2,2,2,2],
+'U':[5,5,5,5,7],'V':[5,5,5,5,2],'W':[5,5,7,7,5],'X':[5,5,2,5,5],'Y':[5,5,2,2,2],
+'Z':[7,1,2,4,7],
+'0':[7,5,5,5,7],'1':[2,6,2,2,7],'2':[7,1,7,4,7],'3':[7,1,3,1,7],'4':[5,5,7,1,1],
+'5':[7,4,7,1,7],'6':[7,4,7,5,7],'7':[7,1,1,2,2],'8':[7,5,7,5,7],'9':[7,5,7,1,7],
+'%':[5,1,2,4,5],'!':[2,2,2,0,2],':':[0,2,0,2,0],'.':[0,0,0,0,2],'-':[0,0,7,0,0],
+'_':[0,0,0,0,7],'+':[0,2,7,2,0],' ':[0,0,0,0,0]
+};
+function drawText(s,x,y,inv){
+  s=String(s).toUpperCase();
+  for(let i=0;i<s.length;i++){
+    const g=F[s[i]]||F[' '], cx=x+i*4;
+    for(let yy=0;yy<6;yy++)for(let xx=0;xx<4;xx++) sp(cx+xx,y+yy, inv?1:0);   // cell
+    for(let r=0;r<5;r++)for(let b=0;b<3;b++)
+      if((g[r]>>(2-b))&1) sp(cx+b,y+r, inv?0:1);                              // glyph
+  }
+}
+function drawNum(n,d,x,y){ drawText(String(Math.max(0,n|0)).padStart(d,'0').slice(-d),x,y,false); }
+
+/* ---------- enemy sprite baking: number XOR'd into hull (as original) ---------- */
+function makeSubSprite(hp,facingRight){
+  const rows=(facingRight?SUBR:SUBL).slice();
+  const cx=facingRight?5:4, s=String(hp).padStart(2,'0').slice(-2);
+  for(let y=0;y<6;y++){
+    let m=0;
+    for(let i=0;i<8;i++){
+      let bit=1;
+      if(y>0){
+        const d=i<4?0:1, col=i%4;
+        if(col<3 && ((F[s[d]][y-1]>>(2-col))&1)) bit=0;   // glyph rows 1-5: aligned to the hull's hollow interior
+      }
+      if(bit) m|=1<<(15-(cx+i));
+    }
+    rows[y]^=m;   // XOR inverse-text cell over hull — exactly the original trick
+  }
+  return rows;
+}
+
+/* ---------- game state ---------- */
+const rnd=n=>Math.floor(Math.random()*n);
+let state='title', paused=false;
+let boatx, hits, sink, numlb, numrb, score, level, shipsmax, shipsleft, numhit, pct;
+let bc, ec1, ec2, ec3, cdL, cdR, freeze;
+let enemies, pb, eb, hb, explosions;
+let highscore=100, highname='SAM', entryName='';
+try{
+  const s=localStorage.getItem('subhunt_hs');
+  if(s){ const o=JSON.parse(s); highscore=(o.score|0)||100; highname=String(o.name||'SAM').slice(0,3); }
+}catch(e){ /* storage unavailable (e.g. sandboxed preview) — session-only fallback */ }
+function saveHS(){
+  try{ localStorage.setItem('subhunt_hs', JSON.stringify({score:highscore,name:highname})); }catch(e){}
+}
+let heldL=false,heldR=false,heldFL=false,heldFR=false;
+
+function resetAll(){
+  boatx=36; hits=0; sink=0; numlb=5; numrb=5; score=0; level=0;
+  shipsmax=0; shipsleft=0; numhit=0; pct=0;
+  bc=2; ec1=3; ec2=2; ec3=1; cdL=0; cdR=0; freeze=0;
+  enemies=new Array(8).fill(null);
+  pb=Array.from({length:10},()=>({x:0,y:0}));
+  eb=Array.from({length:15},()=>({x:0,y:0}));
+  hb=Array.from({length:15},()=>({x:0,y:0}));
+  explosions=[];
+}
+resetAll();
+
+function initLevel(){
+  level++;
+  if(level===16){ state='won'; return; }
+  shipsmax=shipsleft=level*5; numhit=0;
+  state='play';
+}
+
+const tc=(v,b)=>(v-1<0?b:v-1);
+
+function newEnemy(){
+  if(shipsmax<=0) return;
+  const slot=enemies.indexOf(null); if(slot<0) return;
+  shipsmax--;
+  const speed=rnd(4);                                  // 0..3
+  let raw; do{ raw=rnd(8); }while(enemies.some(e=>e&&e.raw===raw));   // unique depth
+  const hp=(speed+3)*(raw+2);                          // point value = (speed+3)*(depth+1)
+  const dir=rnd(2);                                    // 0 = moves right, 1 = moves left
+  enemies[slot]={x:dir?95:-15, y:raw*6+16, dir, speed, hp, raw,
+                 rows:makeSubSprite(hp, dir===0)};
+}
+
+function fireShot(e){
+  const arr=(level>=8 && rnd(5)===0)?hb:eb;            // homing at lvl 8+, 1-in-5
+  const b=arr.find(b=>!b.y); if(!b) return;
+  b.y=e.y; b.x=e.x+7;
+}
+
+function detonate(b){
+  explosions.push({x:b.x,y:12,spr:EXPL2,ttl:1});
+  freeze=3; b.y=0;
+  const d=boatx+1-b.x;
+  if(d===0||(d<0&&d>=-19)) hits++;                     // boatx+1 <= bx <= boatx+20
+}
+
+function playerFire(side){
+  if(bc!==2) return;                                   // original: fire only on Bcounter==2 frames
+  if(side==='l'){
+    if(numlb<=0) return; numlb--; cdL=6;
+    const p=pb.find((p,i)=>i<5&&!p.y); if(p){p.x=boatx; p.y=14;}
+  }else{
+    if(numrb<=0) return; numrb--; cdR=6;
+    const p=pb.find((p,i)=>i>=5&&!p.y); if(p){p.x=boatx+22; p.y=14;}
+  }
+}
+
+function scanBullets(){
+  for(let pi=0;pi<10;pi++){
+    const p=pb[pi]; if(!p.y) continue;
+    for(let i=0;i<8;i++){
+      const e=enemies[i]; if(!e) continue;
+      const d=e.x-(p.x+1);
+      if(!(d===0||(d<0&&d>=-18))) continue;            // 18px-wide hull window
+      const dy=e.y-(p.y-1);
+      if(!(dy===0||(dy<0&&dy>=-7))) continue;          // 8px-tall window
+      score=Math.min(99999,score+e.hp);
+      explosions.push({x:p.x-2,y:p.y-4,spr:EXPL,ttl:1});
+      p.y=70;                                          // original quirk: bullet parked at 70, refunds next move
+      enemies[i]=null; shipsleft--; numhit++; freeze=3;
+      break;
+    }
+  }
+}
+
+function update(){
+  if(freeze>0){ freeze--; return; }
+  explosions=explosions.filter(e=>--e.ttl>=0);
+
+  if(state==='dying'){
+    sink++;
+    if(sink>=58){
+      if(score>highscore){ highscore=score; saveHS(); entryName=''; state='entry'; }
+      else { resetAll(); state='title'; }
+    }
+    return;
+  }
+  if(state!=='play') return;
+
+  // counters (enemy speed gates: every 4th / 3rd / 2nd frame)
+  ec3=tc(ec3,1); ec2=tc(ec2,2); ec1=tc(ec1,3);
+
+  // spawn roll: rand(255) < (level>=7 ? level : 6)
+  if(rnd(255) < (level>=7?level:6)) newEnemy();
+
+  // enemies: fire + move
+  for(let i=0;i<8;i++){
+    const e=enemies[i]; if(!e) continue;
+    if(rnd(85)===0) fireShot(e);
+    const mv = e.speed===3 || (e.speed===2&&ec3===0) ||
+               (e.speed===1&&ec2===0) || (e.speed===0&&ec1===0);
+    if(mv){
+      if(e.dir===0){ if(++e.x===95){ enemies[i]=null; shipsleft--; } }
+      else         { if(--e.x===-15){ enemies[i]=null; shipsleft--; } }
+    }
+  }
+
+  // bullets: move every other frame (Bcounter)
+  bc--;
+  if(bc===0){
+    pb.forEach((p,i)=>{ if(p.y && ++p.y>=64){ p.y=0; if(i<5)numlb++; else numrb++; } });
+    eb.forEach(b=>{ if(b.y && --b.y===12) detonate(b); });
+    hb.forEach(b=>{ if(b.y){
+      const t=boatx+10;
+      if(b.x<t)b.x++; else if(b.x>t)b.x--;             // steer ±1 toward boat
+      if(--b.y===12) detonate(b);
+    }});
+    bc=2;
+  }
+
+  scanBullets();
+
+  if(hits>=3){ state='dying'; sink=0; return; }
+  if(shipsleft<=0){
+    pct=Math.floor(numhit*100/(level*5));
+    if(pct===100) score=Math.min(99999,score+100);     // Perfect bonus
+    state='leveldone'; return;
+  }
+
+  // input
+  if(heldR && boatx<72) boatx++;
+  if(heldL && boatx>0)  boatx--;
+  if(cdL>0)cdL--; else if(heldFL) playerFire('l');
+  if(cdR>0)cdR--; else if(heldFR) playerFire('r');
+}
+
+/* ---------- rendering ---------- */
+function scene(){
+  clearBuf();
+  // boat (sinks with damage: y = 6 + hits)
+  xorSpr(BOAT,24,boatx, 6+hits+(state==='dying'?sink:0));
+  // water line (rows 13/14, original dash pattern)
+  for(let x=0;x<W;x++){ if(x%8===0) sp(x,13,1); else sp(x,14,1); }
+  // top bar
+  for(let x=0;x<W;x++) sp(x,5,1);
+  drawText(' SUBHUNT',0,0,true);
+  for(let i=0;i<numlb;i++) xorSpr(BOMB,8,45-3*i,1);
+  for(let i=0;i<numrb;i++) xorSpr(BOMB,8,70+3*i,1);
+  drawNum(score,5,49,0);
+  drawNum(level,2,86,0);
+  // entities (all XOR, like the original gbuf)
+  enemies.forEach(e=>{ if(e) xorSpr(e.rows,16,e.x,e.y); });
+  pb.forEach(p=>{ if(p.y&&p.y<64) xorSpr(BOMB,8,p.x,p.y); });
+  eb.forEach(b=>{ if(b.y) xorSpr(EBOMB,8,b.x,b.y); });
+  hb.forEach(b=>{ if(b.y) xorSpr(EBOMB2,8,b.x,b.y); });
+  explosions.forEach(e=>xorSpr(e.spr,8,e.x,e.y));
+}
+
+function render(){
+  scene();
+  if(state==='title'){
+    drawText('SUBHUNT V1.4',24,25);
+    drawText('PROGRAMMED BY:',20,32);
+    drawText('SAM HEALD',30,39);
+    drawText('HIGHSCORE: '+highname,10,46);
+    drawNum(highscore,5,67,46);
+    drawText('PRESS ENTER',26,56);
+  }
+  else if(state==='leveldone'){
+    drawText('LEVEL DONE!',26,25);
+    const t=pct+'% DESTROYED';
+    drawText(t,Math.floor((96-t.length*4)/2),33);
+    if(pct===100) drawText('PERFECT! +100',22,41);
+  }
+  else if(state==='won'){
+    drawText('CONGRATULATIONS!',16,27);
+    drawText('YOU WON!',32,35);
+  }
+  else if(state==='entry'){
+    drawText('A NEW HIGH SCORE!',14,22);
+    drawText('ENTER YOUR NAME',18,30);
+    drawText((entryName+'___').slice(0,3),42,40);
+  }
+  if(paused && state==='play') drawText('PAUSE',38,30);
+  present();
+}
+
+/* ---------- input ---------- */
+function startGame(){ resetAll(); initLevel(); }
+window.addEventListener('keydown',e=>{
+  if(state==='entry'){
+    if(/^[a-z]$/i.test(e.key)&&entryName.length<3) entryName+=e.key.toUpperCase();
+    else if(e.key==='Backspace') entryName=entryName.slice(0,-1);
+    else if(e.key==='Enter'){ highname=(entryName+'   ').slice(0,3); saveHS(); resetAll(); state='title'; }
+    e.preventDefault(); return;
+  }
+  switch(e.key){
+    case 'ArrowLeft': heldL=true; e.preventDefault(); break;
+    case 'ArrowRight': heldR=true; e.preventDefault(); break;
+    case 'z': case 'Z': heldFL=true; break;
+    case 'x': case 'X': heldFR=true; break;
+    case 'p': case 'P': if(state==='play') paused=!paused; break;
+    case 'Escape':
+      if(state!=='title'){ resetAll(); state='title'; paused=false; }
+      break;
+    case 'Enter':
+      if(state==='title') startGame();
+      else if(state==='leveldone') initLevel();
+      else if(state==='won'){ resetAll(); state='title'; }
+      break;
+  }
+});
+window.addEventListener('keyup',e=>{
+  switch(e.key){
+    case 'ArrowLeft': heldL=false; break;
+    case 'ArrowRight': heldR=false; break;
+    case 'z': case 'Z': heldFL=false; break;
+    case 'x': case 'X': heldFR=false; break;
+  }
+});
+
+// touch / mouse buttons
+function hold(id,set){
+  const el=document.getElementById(id);
+  const on=ev=>{ev.preventDefault();set(true);};
+  const off=ev=>{ev.preventDefault();set(false);};
+  el.addEventListener('pointerdown',on);
+  el.addEventListener('pointerup',off);
+  el.addEventListener('pointerleave',off);
+  el.addEventListener('pointercancel',off);
+}
+hold('bL',v=>heldL=v); hold('bR',v=>heldR=v);
+hold('bFL',v=>heldFL=v); hold('bFR',v=>heldFR=v);
+document.getElementById('bEnt').addEventListener('click',()=>{
+  if(state==='title') startGame();
+  else if(state==='leveldone') initLevel();
+  else if(state==='won'){ resetAll(); state='title'; }
+  else if(state==='entry'){ highname=(entryName+'   ').slice(0,3); saveHS(); resetAll(); state='title'; }
+});
+
+/* ---------- main loop ---------- */
+let last=0, acc=0; const STEP=1000/FPS;
+function loop(t){
+  requestAnimationFrame(loop);
+  acc+=t-last; last=t; if(acc>200)acc=200;
+  while(acc>=STEP){ acc-=STEP; if(!paused) update(); }
+  render();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
